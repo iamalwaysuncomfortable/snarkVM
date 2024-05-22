@@ -65,3 +65,8 @@ package = "snarkvm-console"
 path = "../../console"
 default-features = false
 features = [ "types" ]
+
+[dev-dependencies.parameters]
+package = "snarkvm-parameters"
+path = "../../parameters"
+default-features = false

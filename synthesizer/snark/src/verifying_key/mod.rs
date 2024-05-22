@@ -112,3 +112,19 @@ impl<N: Network> Deref for VerifyingKey<N> {
         &self.verifying_key
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verifying_key_bytes_test() {
+        let verifying_key_bytes = parameters::testnet::TransferPrivateVerifier::load_bytes().unwrap();
+        let verifying_key = VerifyingKey::<console::network::TestnetV0>::from_bytes_le(&verifying_key_bytes);
+
+        if verifying_key.is_err() {
+            println!("{:?}", &verifying_key);
+            assert!(verifying_key.is_ok());
+        }
+    }
+}
