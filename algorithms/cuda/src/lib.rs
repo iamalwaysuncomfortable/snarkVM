@@ -74,6 +74,7 @@ extern "C" {
 
 /// Compute an in-place NTT on the input data.
 #[allow(non_snake_case)]
+#[no_mangle]
 pub fn NTT<T>(
     domain_size: usize,
     inout: &mut [T],
@@ -97,6 +98,7 @@ pub fn NTT<T>(
 }
 
 /// Compute a polynomial multiply
+#[no_mangle]
 pub fn polymul<T: std::clone::Clone>(
     domain: usize,
     polynomials: &Vec<Vec<T>>,
@@ -145,6 +147,7 @@ pub fn polymul<T: std::clone::Clone>(
 }
 
 /// Compute a multi-scalar multiplication
+#[no_mangle]
 pub fn msm<Affine, Projective, Scalar>(points: &[Affine], scalars: &[Scalar]) -> Result<Projective, cuda::Error> {
     let npoints = scalars.len();
     if npoints > points.len() {
