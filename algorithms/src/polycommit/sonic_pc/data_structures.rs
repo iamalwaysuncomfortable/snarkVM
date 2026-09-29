@@ -26,7 +26,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     io,
-    ops::{AddAssign, MulAssign, SubAssign},
+    ops::{AddAssign, Deref, MulAssign, Range, SubAssign},
+    sync::Arc,
 };
 
 /// `UniversalParams` are the universal parameters for the KZG10 scheme.
@@ -38,12 +39,66 @@ pub type Randomness<E> = kzg10::KZGRandomness<E>;
 /// `Commitment` is the commitment for the KZG10 scheme.
 pub type Commitment<E> = kzg10::KZGCommitment<E>;
 
+/// A committer key's bases: points it owns, or a range of an SRS snapshot it
+/// shares. A snapshot never changes once made, so a shared range stays valid
+/// for as long as the key holds it.
+#[derive(Clone)]
+pub enum Bases<G> {
+    Owned(Vec<G>),
+    Shared { store: Arc<Vec<G>>, range: Range<usize> },
+}
+
+/// The key's own points, not the whole snapshot a shared range is cut from,
+/// which can be millions of them.
+impl<G: fmt::Debug> fmt::Debug for Bases<G> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<G> Deref for Bases<G> {
+    type Target = [G];
+
+    fn deref(&self) -> &[G] {
+        match self {
+            Self::Owned(points) => points,
+            Self::Shared { store, range } => &store[range.clone()],
+        }
+    }
+}
+
+impl<G> Bases<G> {
+    /// A range of `store`, checked here rather than on first use.
+    pub fn shared(store: Arc<Vec<G>>, range: Range<usize>) -> Self {
+        assert!(
+            range.start <= range.end && range.end <= store.len(),
+            "a shared range {range:?} outside a snapshot of {} points",
+            store.len()
+        );
+        Self::Shared { store, range }
+    }
+}
+
+/// Written as a `Vec` of the points is, so a key's bytes and hash don't depend
+/// on whether it shares them.
+impl<G: ToBytes> ToBytes for Bases<G> {
+    fn write_le<W: Write>(&self, writer: W) -> io::Result<()> {
+        (&**self).write_le(writer)
+    }
+}
+
+impl<G> From<Vec<G>> for Bases<G> {
+    fn from(points: Vec<G>) -> Self {
+        Self::Owned(points)
+    }
+}
+
 /// `CommitterKey` is used to commit to, and create evaluation proofs for, a
 /// given polynomial.
 #[derive(Debug)]
 pub struct CommitterKey<E: PairingEngine> {
     /// The key used to commit to polynomials.
-    pub powers_of_beta_g: Vec<E::G1Affine>,
+    pub powers_of_beta_g: Bases<E::G1Affine>,
 
     /// The key used to commit to polynomials in Lagrange basis.
     pub lagrange_bases_at_beta_g: BTreeMap<usize, Vec<E::G1Affine>>,
@@ -53,7 +108,7 @@ pub struct CommitterKey<E: PairingEngine> {
 
     /// The powers used to commit to shifted polynomials.
     /// This is `None` if `self` does not support enforcing any degree bounds.
-    pub shifted_powers_of_beta_g: Option<Vec<E::G1Affine>>,
+    pub shifted_powers_of_beta_g: Option<Bases<E::G1Affine>>,
 
     /// The powers used to commit to shifted hiding polynomials.
     /// This is `None` if `self` does not support enforcing any degree bounds.
@@ -186,10 +241,10 @@ impl<E: PairingEngine> FromBytes for CommitterKey<E> {
         }
 
         Ok(Self {
-            powers_of_beta_g,
+            powers_of_beta_g: powers_of_beta_g.into(),
             lagrange_bases_at_beta_g,
             powers_of_beta_times_gamma_g,
-            shifted_powers_of_beta_g,
+            shifted_powers_of_beta_g: shifted_powers_of_beta_g.map(Bases::from),
             shifted_powers_of_beta_times_gamma_g,
             enforced_degree_bounds,
         })
@@ -200,7 +255,7 @@ impl<E: PairingEngine> ToBytes for CommitterKey<E> {
     fn write_le<W: Write>(&self, mut writer: W) -> io::Result<()> {
         // Serialize `powers`.
         (self.powers_of_beta_g.len() as u32).write_le(&mut writer)?;
-        for power in &self.powers_of_beta_g {
+        for power in self.powers_of_beta_g.iter() {
             power.write_le(&mut writer)?;
         }
 
@@ -223,7 +278,7 @@ impl<E: PairingEngine> ToBytes for CommitterKey<E> {
         self.shifted_powers_of_beta_g.is_some().write_le(&mut writer)?;
         if let Some(shifted_powers_of_beta_g) = &self.shifted_powers_of_beta_g {
             (shifted_powers_of_beta_g.len() as u32).write_le(&mut writer)?;
-            for shifted_power in shifted_powers_of_beta_g {
+            for shifted_power in shifted_powers_of_beta_g.iter() {
                 shifted_power.write_le(&mut writer)?;
             }
         }
@@ -285,21 +340,21 @@ impl<E: PairingEngine> CommitterKey<E> {
 #[derive(Debug)]
 pub struct CommitterUnionKey<'a, E: PairingEngine> {
     /// The key used to commit to polynomials.
-    pub powers_of_beta_g: Option<&'a Vec<E::G1Affine>>,
+    pub powers_of_beta_g: Option<&'a [E::G1Affine]>,
 
     /// The key used to commit to polynomials in Lagrange basis.
     pub lagrange_bases_at_beta_g: BTreeMap<usize, &'a Vec<E::G1Affine>>,
 
     /// The key used to commit to hiding polynomials.
-    pub powers_of_beta_times_gamma_g: Option<&'a Vec<E::G1Affine>>,
+    pub powers_of_beta_times_gamma_g: Option<&'a [E::G1Affine]>,
 
     /// The powers used to commit to shifted polynomials.
     /// This is `None` if `self` does not support enforcing any degree bounds.
-    pub shifted_powers_of_beta_g: Option<&'a Vec<E::G1Affine>>,
+    pub shifted_powers_of_beta_g: Option<&'a [E::G1Affine]>,
 
     /// The powers used to commit to shifted hiding polynomials.
     /// This is `None` if `self` does not support enforcing any degree bounds.
-    pub shifted_powers_of_beta_times_gamma_g: Option<BTreeMap<usize, &'a Vec<E::G1Affine>>>,
+    pub shifted_powers_of_beta_times_gamma_g: Option<BTreeMap<usize, &'a [E::G1Affine]>>,
 
     /// The degree bounds that are supported by `self`.
     /// Sorted in ascending order from smallest bound to largest bound.
@@ -311,8 +366,8 @@ impl<'a, E: PairingEngine> CommitterUnionKey<'a, E> {
     /// Obtain powers for the underlying KZG10 construction
     pub fn powers(&self) -> kzg10::Powers<E> {
         kzg10::Powers {
-            powers_of_beta_g: self.powers_of_beta_g.unwrap().as_slice().into(),
-            powers_of_beta_times_gamma_g: self.powers_of_beta_times_gamma_g.unwrap().as_slice().into(),
+            powers_of_beta_g: self.powers_of_beta_g.unwrap().into(),
+            powers_of_beta_times_gamma_g: self.powers_of_beta_times_gamma_g.unwrap().into(),
         }
     }
 
@@ -330,7 +385,7 @@ impl<'a, E: PairingEngine> CommitterUnionKey<'a, E> {
 
                 let ck = kzg10::Powers {
                     powers_of_beta_g: shifted_powers_of_beta_g[powers_range].into(),
-                    powers_of_beta_times_gamma_g: shifted_powers_of_beta_times_gamma_g[&bound].clone().into(),
+                    powers_of_beta_times_gamma_g: shifted_powers_of_beta_times_gamma_g[&bound].into(),
                 };
 
                 Some(ck)
@@ -361,7 +416,7 @@ impl<'a, E: PairingEngine> CommitterUnionKey<'a, E> {
         };
         let mut enforced_degree_bounds = vec![];
         let mut biggest_ck: Option<&CommitterKey<E>> = None;
-        let mut shifted_powers_of_beta_times_gamma_g = BTreeMap::new();
+        let mut shifted_powers_of_beta_times_gamma_g: BTreeMap<usize, &'a [E::G1Affine]> = BTreeMap::new();
         for ck in committer_keys {
             if biggest_ck.is_none() || biggest_ck.unwrap().len() < ck.len() {
                 biggest_ck = Some(ck);
@@ -372,7 +427,7 @@ impl<'a, E: PairingEngine> CommitterUnionKey<'a, E> {
             }
             if let Some(shifted_powers) = ck.shifted_powers_of_beta_times_gamma_g.as_ref() {
                 for (bound_power, powers) in shifted_powers.iter() {
-                    shifted_powers_of_beta_times_gamma_g.entry(*bound_power).or_insert(powers);
+                    shifted_powers_of_beta_times_gamma_g.entry(*bound_power).or_insert(powers.as_slice());
                 }
             }
             if let Some(degree_bounds) = &ck.enforced_degree_bounds {
@@ -382,8 +437,8 @@ impl<'a, E: PairingEngine> CommitterUnionKey<'a, E> {
 
         let biggest_ck = biggest_ck.unwrap();
         ck_union.powers_of_beta_g = Some(&biggest_ck.powers_of_beta_g);
-        ck_union.powers_of_beta_times_gamma_g = Some(&biggest_ck.powers_of_beta_times_gamma_g);
-        ck_union.shifted_powers_of_beta_g = biggest_ck.shifted_powers_of_beta_g.as_ref();
+        ck_union.powers_of_beta_times_gamma_g = Some(biggest_ck.powers_of_beta_times_gamma_g.as_slice());
+        ck_union.shifted_powers_of_beta_g = biggest_ck.shifted_powers_of_beta_g.as_deref();
 
         if !enforced_degree_bounds.is_empty() {
             enforced_degree_bounds.sort();

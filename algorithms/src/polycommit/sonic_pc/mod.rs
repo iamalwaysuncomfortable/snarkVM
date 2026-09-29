@@ -78,6 +78,18 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
             v
         });
 
+        // Every prefix download before anything is shared: a later one would
+        // replace a snapshot this key already shared, which the key would then
+        // keep alive after the SRS moved on. The suffix is downloaded, and shared,
+        // below, and touches only the suffix.
+        let supported_lagrange_sizes: Vec<usize> = supported_lagrange_sizes.into_iter().collect();
+        pp.download_powers_for(0..supported_degree + 1)?;
+        for &size in &supported_lagrange_sizes {
+            if size.is_power_of_two() && size <= max_degree + 1 {
+                pp.download_powers_for(0..size)?;
+            }
+        }
+
         let (shifted_powers_of_beta_g, shifted_powers_of_beta_times_gamma_g) = if let Some(enforced_degree_bounds) =
             enforced_degree_bounds.as_ref()
         {
@@ -98,7 +110,8 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
                     max_degree - lowest_shift_degree + 1
                 ));
 
-                let shifted_powers_of_beta_g = pp.powers_of_beta_g(lowest_shift_degree, pp.max_degree() + 1)?;
+                let (store, range) = pp.shared_powers_of_beta_g(lowest_shift_degree, pp.max_degree() + 1)?;
+                let shifted_powers_of_beta_g = Bases::shared(store, range);
                 let mut shifted_powers_of_beta_times_gamma_g = BTreeMap::new();
                 // Also add degree 0.
                 for degree_bound in enforced_degree_bounds {
@@ -121,7 +134,8 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
             (None, None)
         };
 
-        let powers_of_beta_g = pp.powers_of_beta_g(0, supported_degree + 1)?;
+        let (store, range) = pp.shared_powers_of_beta_g(0, supported_degree + 1)?;
+        let powers_of_beta_g = Bases::shared(store, range);
         let powers_of_beta_times_gamma_g = pp
             .powers_of_beta_times_gamma_g()
             .range(0..=(supported_hiding_bound + 1))
@@ -694,7 +708,7 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
 mod tests {
     #![allow(non_camel_case_types)]
 
-    use super::{CommitterKey, SonicKZG10};
+    use super::{Bases, CommitterKey, SonicKZG10};
     use crate::{crypto_hash::PoseidonSponge, polycommit::test_templates::*};
     use snarkvm_curves::bls12_377::{Bls12_377, Fq};
     use snarkvm_utilities::{FromBytes, ToBytes, rand::TestRng};
@@ -721,6 +735,76 @@ mod tests {
         let ck_recovered_bytes = ck_recovered.to_bytes_le().unwrap();
 
         assert_eq!(&ck_bytes, &ck_recovered_bytes);
+    }
+
+    /// `trim` shares its bases with the SRS instead of copying them, and they
+    /// are the same points a copy held.
+    #[test]
+    fn trim_shares_its_bases_with_the_srs() {
+        let pp = PC_Bls12_377::load_srs((1 << 12) - 1).unwrap();
+        let (ck, _) = PC_Bls12_377::trim(&pp, 1000, [], 1, Some(&[500])).unwrap();
+        let top = pp.max_degree();
+
+        assert!(matches!(ck.powers_of_beta_g, Bases::Shared { .. }));
+        assert_eq!(&*ck.powers_of_beta_g, pp.powers_of_beta_g(0, 1001).unwrap().as_slice());
+
+        let shifted = ck.shifted_powers_of_beta_g.as_ref().unwrap();
+        assert!(matches!(shifted, Bases::Shared { .. }));
+        assert_eq!(&**shifted, pp.powers_of_beta_g(top - 500, top + 1).unwrap().as_slice());
+
+        // Bytes, and so the key's hash, are those of the points, however held.
+        let bytes = ck.to_bytes_le().unwrap();
+        let read: CommitterKey<Bls12_377> = FromBytes::read_le(&bytes[..]).unwrap();
+        assert!(matches!(read.powers_of_beta_g, Bases::Owned(_)), "a key read from bytes owns its bases");
+        assert_eq!(read.to_bytes_le().unwrap(), bytes);
+    }
+
+    /// Growing the SRS replaces its snapshot, never mutating the one a key
+    /// shares: a key trimmed before the growth reads the same points after it.
+    #[test]
+    fn a_key_keeps_its_snapshot_across_a_growth() {
+        let pp = PC_Bls12_377::load_srs((1 << 15) - 1).unwrap();
+        let (before, _) = PC_Bls12_377::trim(&pp, 1000, [], 1, Some(&[500])).unwrap();
+        let points = before.powers_of_beta_g.to_vec();
+
+        pp.download_powers_for(0..(1 << 16)).unwrap();
+        let (after, _) = PC_Bls12_377::trim(&pp, 1000, [], 1, Some(&[500])).unwrap();
+
+        assert_eq!(&*before.powers_of_beta_g, points.as_slice(), "the older snapshot changed");
+        assert_eq!(&*after.powers_of_beta_g, points.as_slice());
+        assert_ne!(
+            before.powers_of_beta_g.as_ptr(),
+            after.powers_of_beta_g.as_ptr(),
+            "a key trimmed after the growth should share the new snapshot"
+        );
+    }
+
+    /// A `trim` whose Lagrange sizes grow the SRS shares the snapshot that
+    /// growth made, not the one it replaced.
+    #[test]
+    fn trim_shares_the_snapshot_left_after_its_own_downloads() {
+        let pp = PC_Bls12_377::load_srs((1 << 15) - 1).unwrap();
+        let (ck, _) = PC_Bls12_377::trim(&pp, 1000, [1 << 16], 1, Some(&[500])).unwrap();
+        let (current, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
+        match &ck.powers_of_beta_g {
+            Bases::Shared { store, .. } => {
+                assert!(std::sync::Arc::ptr_eq(store, &current), "the key shares a snapshot its own trim replaced")
+            }
+            Bases::Owned(_) => panic!("trim should share"),
+        }
+    }
+
+    /// An empty range asks for nothing, so it neither downloads nor replaces
+    /// the snapshot keys share, even one starting where the held prefix ends.
+    #[test]
+    fn an_empty_range_leaves_the_snapshot_alone() {
+        let pp = PC_Bls12_377::load_srs((1 << 15) - 1).unwrap();
+        let (before, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
+        let held = 1 << 15;
+        assert!(pp.powers_of_beta_g(held, held).unwrap().is_empty());
+        assert!(pp.powers_of_beta_g(0, 0).unwrap().is_empty());
+        let (after, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&before, &after), "an empty range replaced the snapshot");
     }
 
     #[test]
