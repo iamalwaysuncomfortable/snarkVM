@@ -746,10 +746,12 @@ mod tests {
         let top = pp.max_degree();
 
         assert!(matches!(ck.powers_of_beta_g, Bases::Shared { .. }));
+        assert_eq!(ck.powers_of_beta_g.owned_capacity(), 0, "a shared prefix owns nothing");
         assert_eq!(&*ck.powers_of_beta_g, pp.powers_of_beta_g(0, 1001).unwrap().as_slice());
 
         let shifted = ck.shifted_powers_of_beta_g.as_ref().unwrap();
         assert!(matches!(shifted, Bases::Shared { .. }));
+        assert_eq!(shifted.owned_capacity(), 0, "a shared suffix owns nothing");
         assert_eq!(&**shifted, pp.powers_of_beta_g(top - 500, top + 1).unwrap().as_slice());
 
         // Bytes, and so the key's hash, are those of the points, however held.
@@ -805,6 +807,20 @@ mod tests {
         assert!(pp.powers_of_beta_g(0, 0).unwrap().is_empty());
         let (after, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
         assert!(std::sync::Arc::ptr_eq(&before, &after), "an empty range replaced the snapshot");
+    }
+
+    /// `to_mut` turns a shared range into an owned copy, leaving the SRS as it
+    /// was.
+    #[test]
+    fn editing_a_shared_key_copies_it_first() {
+        use super::Bases;
+        let pp = PC_Bls12_377::load_srs((1 << 12) - 1).unwrap();
+        let (mut ck, _) = PC_Bls12_377::trim(&pp, 1000, [], 1, Some(&[500])).unwrap();
+        ck.powers_of_beta_g.to_mut().swap(0, 1);
+        assert!(matches!(ck.powers_of_beta_g, Bases::Owned(_)));
+        assert_ne!(&*ck.powers_of_beta_g, pp.powers_of_beta_g(0, 1001).unwrap().as_slice());
+        let (fresh, _) = PC_Bls12_377::trim(&pp, 1000, [], 1, Some(&[500])).unwrap();
+        assert_eq!(&*fresh.powers_of_beta_g, pp.powers_of_beta_g(0, 1001).unwrap().as_slice());
     }
 
     #[test]

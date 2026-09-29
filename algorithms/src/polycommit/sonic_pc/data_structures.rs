@@ -79,6 +79,30 @@ impl<G> Bases<G> {
     }
 }
 
+impl<G: Clone> Bases<G> {
+    /// Points this key allocated itself: none when it shares them, which is
+    /// what a key cache should budget for. A shared key can still keep an
+    /// older snapshot alive after the SRS grows past it; that is bounded by
+    /// the SRS, not by the key, and is not counted here.
+    pub fn owned_capacity(&self) -> usize {
+        match self {
+            Self::Owned(points) => points.capacity(),
+            Self::Shared { .. } => 0,
+        }
+    }
+
+    /// The points, to edit; a shared range becomes an owned copy first.
+    pub fn to_mut(&mut self) -> &mut Vec<G> {
+        if let Self::Shared { .. } = self {
+            *self = Self::Owned(self.to_vec());
+        }
+        match self {
+            Self::Owned(points) => points,
+            Self::Shared { .. } => unreachable!("made owned above"),
+        }
+    }
+}
+
 /// Written as a `Vec` of the points is, so a key's bytes and hash don't depend
 /// on whether it shares them.
 impl<G: ToBytes> ToBytes for Bases<G> {
