@@ -86,3 +86,7 @@ optional = true
 workspace = true
 features = ["json", "gzip", "rustls"]
 optional = true
+
+[dev-dependencies.tokio]
+version = "1"
+features = ["rt"]

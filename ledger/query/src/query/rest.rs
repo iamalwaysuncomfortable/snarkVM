@@ -623,6 +623,140 @@ mod tests {
         assert!(waited < Duration::from_secs(5), "the stall bound did not fire, it waited {waited:?}");
     }
 
+    /// Answers a height whose body arrives in `pieces` slices of whitespace `gap` apart, then the
+    /// digits: a healthy response that takes `pieces * gap` to finish.
+    fn dribbling_node(pieces: usize, gap: Duration) -> (String, Arc<AtomicUsize>) {
+        node(move |mut stream| {
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                pieces * 8 + 3
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.flush();
+            for _ in 0..pieces {
+                std::thread::sleep(gap);
+                let _ = stream.write_all(b"        ");
+                let _ = stream.flush();
+            }
+            let _ = stream.write_all(b"123");
+            let _ = stream.flush();
+        })
+    }
+
+    /// A body that finishes within the stall bound arrives, however many reads it takes.
+    #[test]
+    fn a_body_within_the_stall_bound_arrives_in_pieces() {
+        let (url, _) = dribbling_node(4, Duration::from_millis(100));
+        let query = bounded_query(&url, Duration::from_secs(5), Duration::from_secs(120));
+
+        assert_eq!(query.current_block_height().expect("a body that arrives in pieces is still a height"), 123);
+    }
+
+    /// On the sync path `stall` is a budget for the whole body, anchored at the headers, so a
+    /// body that keeps moving but outlasts it is cut off. The async path reads the same bound as a
+    /// gap between reads; its test below asserts the opposite.
+    #[test]
+    fn a_body_that_outlasts_the_stall_bound_is_cut_off() {
+        let (url, _) = dribbling_node(8, Duration::from_millis(150));
+        let query = bounded_query(&url, Duration::from_millis(500), Duration::from_secs(120));
+
+        let started = Instant::now();
+        let result = query.current_block_height();
+        let waited = started.elapsed();
+
+        assert!(result.is_err(), "the body budget did not cut the response off");
+        assert!(waited < Duration::from_secs(5), "the body budget did not fire, it waited {waited:?}");
+    }
+
+    #[cfg(feature = "async")]
+    mod r#async {
+        use super::*;
+
+        /// Runs `future` on a single-threaded runtime, which is all reqwest needs.
+        fn block_on<F: std::future::Future>(future: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a single-threaded runtime")
+                .block_on(future)
+        }
+
+        /// The async stall bound is a gap between reads, so a body that keeps moving arrives
+        /// however long it takes.
+        #[test]
+        fn a_body_longer_than_the_stall_bound_arrives_if_it_keeps_moving() {
+            block_on(async {
+                let (url, _) = dribbling_node(8, Duration::from_millis(150));
+                let query = bounded_query(&url, Duration::from_millis(500), Duration::from_secs(120));
+
+                assert_eq!(query.current_block_height_async().await.expect("a body that keeps moving arrives"), 123);
+            });
+        }
+
+        /// A timeout is not a lost request, so it is not asked again.
+        #[test]
+        fn a_query_that_times_out_is_not_asked_again() {
+            block_on(async {
+                let (url, connections) = stalling_node(b"");
+                let query = bounded_query(&url, Duration::from_secs(30), Duration::from_millis(500));
+
+                let started = Instant::now();
+                assert!(
+                    query.current_block_height_async().await.is_err(),
+                    "a node that answers nothing cannot produce a height"
+                );
+                let waited = started.elapsed();
+
+                assert_eq!(
+                    connections.load(Ordering::SeqCst),
+                    1,
+                    "the request was asked again and the bound paid twice"
+                );
+                assert!(waited < Duration::from_secs(5), "the bound was not spent once, it waited {waited:?}");
+            });
+        }
+
+        /// A request lost late in the total bound is asked again with only what is left of it.
+        #[test]
+        fn a_lost_request_is_asked_again_within_the_total_bound() {
+            block_on(async {
+                let (url, connections) = closing_node(Duration::from_millis(800));
+                let query = bounded_query(&url, Duration::from_secs(30), Duration::from_secs(1));
+
+                let started = Instant::now();
+                assert!(
+                    query.current_block_height_async().await.is_err(),
+                    "a node that closes without answering cannot produce a height"
+                );
+                let waited = started.elapsed();
+
+                assert_eq!(connections.load(Ordering::SeqCst), 2, "the lost request was not asked again");
+                assert!(waited < Duration::from_millis(1400), "the total bound was paid twice, it waited {waited:?}");
+            });
+        }
+
+        /// The second query goes out on the connection the first left in the pool, which the peer
+        /// has since abandoned; hyper does not retry a request it had begun writing.
+        #[test]
+        fn a_query_lost_on_a_pooled_connection_is_asked_again() {
+            block_on(async {
+                let (url, connections) = abandoning_node();
+                let query = bounded_query(&url, Duration::from_secs(5), Duration::from_secs(10));
+
+                query.current_block_height_async().await.expect("the node answers the first height");
+                query.current_block_height_async().await.expect("the second height survives the abandoned connection");
+
+                assert_eq!(
+                    connections.load(Ordering::SeqCst),
+                    2,
+                    "the request was not asked again on a fresh connection"
+                );
+            });
+        }
+    }
+
     /// Tests HTTP's behavior of printing an empty path `/`
     ///
     /// `generate_endpoint` can handle base_urls with and without a trailing slash.
