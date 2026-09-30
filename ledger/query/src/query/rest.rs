@@ -46,7 +46,11 @@ const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub struct RestQuery<N: Network> {
     base_url: http::Uri,
-    /// Carries the bounds as well as the connection pool; the async client is configured from these.
+    /// The bounds every request runs under; see [`Self::with_timeouts`].
+    connect: Duration,
+    stall: Duration,
+    total: Duration,
+    /// Holds the connection pool; built from the bounds above.
     agent: ureq::Agent,
     /// Built on first use, since building one can fail and this type is constructed infallibly;
     /// shared by every clone, so that repeated queries reuse a connection.
@@ -72,6 +76,9 @@ impl<N: Network> From<http::Uri> for RestQuery<N> {
     fn from(base_url: http::Uri) -> Self {
         Self {
             base_url,
+            connect: DEFAULT_CONNECT_TIMEOUT,
+            stall: DEFAULT_STALL_TIMEOUT,
+            total: DEFAULT_TOTAL_TIMEOUT,
             agent: agent(DEFAULT_CONNECT_TIMEOUT, DEFAULT_STALL_TIMEOUT, DEFAULT_TOTAL_TIMEOUT),
             #[cfg(feature = "async")]
             client: Default::default(),
@@ -92,17 +99,7 @@ impl<N: Network> RestQuery<N> {
         // reqwest's wasm `ClientBuilder` has neither method (the browser owns the connection);
         // the total bound is set per request, which both backends support.
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = {
-            let timeouts = self.agent.config().timeouts();
-            let mut builder = builder;
-            if let Some(connect) = timeouts.connect {
-                builder = builder.connect_timeout(connect);
-            }
-            if let Some(stall) = timeouts.recv_body {
-                builder = builder.read_timeout(stall);
-            }
-            builder
-        };
+        let builder = builder.connect_timeout(self.connect).read_timeout(self.stall);
         let built = builder.build().with_context(|| format!("Failed to build an HTTP client for {}", self.base_url))?;
         Ok(self.client.get_or_init(|| built))
     }
@@ -110,6 +107,9 @@ impl<N: Network> RestQuery<N> {
     /// Sets how long each request may take: `connect` to establish the connection, `stall` for the
     /// answer to begin and then for its body (on the async path, between successive reads), `total` overall.
     pub fn with_timeouts(mut self, connect: Duration, stall: Duration, total: Duration) -> Self {
+        self.connect = connect;
+        self.stall = stall;
+        self.total = total;
         self.agent = agent(connect, stall, total);
         #[cfg(feature = "async")]
         {
@@ -282,6 +282,12 @@ impl<N: Network> RestQuery<N> {
         Ok(path)
     }
 
+    /// What is left of the total bound for a request that started at `started`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remaining(&self, started: std::time::Instant) -> Duration {
+        self.total.saturating_sub(started.elapsed())
+    }
+
     /// Calls `endpoint`, asking once more if the request was lost on a pooled connection the peer
     /// had closed; the second attempt gets only what is left of the total bound.
     #[cfg(not(target_arch = "wasm32"))]
@@ -289,9 +295,7 @@ impl<N: Network> RestQuery<N> {
         let started = std::time::Instant::now();
         match self.agent.get(endpoint).call() {
             Err(ureq::Error::Io(_)) => {
-                let remaining =
-                    self.agent.config().timeouts().global.map(|total| total.saturating_sub(started.elapsed()));
-                self.agent.get(endpoint).config().timeout_global(remaining).build().call()
+                self.agent.get(endpoint).config().timeout_global(Some(self.remaining(started))).build().call()
             }
             first => first,
         }
@@ -343,24 +347,18 @@ impl<N: Network> RestQuery<N> {
     /// Sends a GET to `endpoint` under the total bound, which goes on the request rather than the
     /// client because that is where reqwest's wasm backend accepts it.
     #[cfg(feature = "async")]
-    fn request(&self, endpoint: &str, total: Option<Duration>) -> Result<reqwest::RequestBuilder> {
-        let mut request = self.client()?.get(endpoint);
-        if let Some(total) = total {
-            request = request.timeout(total);
-        }
-        Ok(request)
+    fn request(&self, endpoint: &str, total: Duration) -> Result<reqwest::RequestBuilder> {
+        Ok(self.client()?.get(endpoint).timeout(total))
     }
 
     /// Async counterpart of [`Self::call`]. hyper-util retries only a request it never began
     /// writing; one written to a closed pooled socket surfaces as a plain request error.
     #[cfg(all(feature = "async", not(target_arch = "wasm32")))]
     async fn send(&self, endpoint: &str) -> Result<reqwest::Response> {
-        let total = self.agent.config().timeouts().global;
         let started = std::time::Instant::now();
-        match self.request(endpoint, total)?.send().await {
+        match self.request(endpoint, self.total)?.send().await {
             Err(error) if error.is_request() && !error.is_timeout() && !error.is_connect() => {
-                let remaining = total.map(|total| total.saturating_sub(started.elapsed()));
-                Ok(self.request(endpoint, remaining)?.send().await?)
+                Ok(self.request(endpoint, self.remaining(started))?.send().await?)
             }
             first => Ok(first?),
         }
@@ -369,7 +367,7 @@ impl<N: Network> RestQuery<N> {
     /// On wasm the browser owns the connection, and there is no clock to budget a retry with.
     #[cfg(all(feature = "async", target_arch = "wasm32"))]
     async fn send(&self, endpoint: &str) -> Result<reqwest::Response> {
-        Ok(self.request(endpoint, self.agent.config().timeouts().global)?.send().await?)
+        Ok(self.request(endpoint, self.total)?.send().await?)
     }
 
     /// Async version of [`Self::get_request`]. Performs a GET request to the given URL and deserializes the returned JSON.
