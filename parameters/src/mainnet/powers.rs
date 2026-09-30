@@ -448,12 +448,13 @@ impl<E: PairingEngine> PowersOfBetaG<E> {
         };
         powers_of_beta_g.reserve(additional_size);
 
-        // Download the powers of two.
-        for num_powers in &download_queue {
+        // Download the powers of two. A chunk that fails leaves the ones before
+        // it appended, so a retry resumes from them rather than fetching them again.
+        let downloaded = download_queue.iter().try_for_each(|&num_powers| -> Result<()> {
             dev_println!("Loading {num_powers} powers");
 
             // Download the universal SRS powers if they're not already on disk.
-            let additional_bytes = match *num_powers {
+            let additional_bytes = match num_powers {
                 NUM_POWERS_16 => Degree16::load_bytes()?,
                 NUM_POWERS_17 => Degree17::load_bytes()?,
                 NUM_POWERS_18 => Degree18::load_bytes()?,
@@ -475,14 +476,17 @@ impl<E: PairingEngine> PowersOfBetaG<E> {
             };
 
             // Deserialize the group elements.
-            let additional_powers = Vec::deserialize_uncompressed_unchecked(&*additional_bytes)?;
+            let additional_powers: Vec<E::G1Affine> = Vec::deserialize_uncompressed_unchecked(&*additional_bytes)?;
             // Extend the powers.
-            powers_of_beta_g.extend(&additional_powers);
-        }
-        ensure!(powers_of_beta_g.len() == final_power_of_two, "Loaded an incorrect number of powers");
+            powers_of_beta_g.extend(additional_powers);
+            Ok(())
+        });
+        // The copy is kept whether or not every chunk arrived, for the same reason.
         if let Some(copy) = copy {
             self.powers_of_beta_g = Arc::new(copy);
         }
+        downloaded?;
+        ensure!(self.powers_of_beta_g.len() == final_power_of_two, "Loaded an incorrect number of powers");
         Ok(())
     }
 
