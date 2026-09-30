@@ -78,31 +78,37 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
             v
         });
 
+        // Every argument is validated before anything is downloaded, so a
+        // rejected call leaves the SRS as it was.
+        let supported_lagrange_sizes: Vec<usize> = supported_lagrange_sizes.into_iter().collect();
+        for &size in &supported_lagrange_sizes {
+            if !size.is_power_of_two() {
+                bail!("The Lagrange basis size ({size}) is not a power of two")
+            }
+            if size > max_degree + 1 {
+                bail!("The Lagrange basis size ({size}) is larger than the supported degree ({})", max_degree + 1)
+            }
+        }
+        if let Some([.., highest_enforced_degree_bound]) = enforced_degree_bounds.as_deref()
+            && *highest_enforced_degree_bound > supported_degree
+        {
+            bail!(
+                "The highest enforced degree bound {highest_enforced_degree_bound} is larger than the supported degree {supported_degree}"
+            );
+        }
+
         // Every prefix download before anything is shared: a later one would
         // replace a snapshot this key already shared, which the key would then
         // keep alive after the SRS moved on. The suffix is downloaded, and shared,
         // below, and touches only the suffix.
-        let supported_lagrange_sizes: Vec<usize> = supported_lagrange_sizes.into_iter().collect();
         pp.download_powers_for(0..supported_degree + 1)?;
         for &size in &supported_lagrange_sizes {
-            if size.is_power_of_two() && size <= max_degree + 1 {
-                pp.download_powers_for(0..size)?;
-            }
+            pp.download_powers_for(0..size)?;
         }
 
-        let (shifted_powers_of_beta_g, shifted_powers_of_beta_times_gamma_g) = if let Some(enforced_degree_bounds) =
-            enforced_degree_bounds.as_ref()
-        {
-            if enforced_degree_bounds.is_empty() {
-                (None, None)
-            } else {
-                let highest_enforced_degree_bound = *enforced_degree_bounds.last().unwrap();
-                if highest_enforced_degree_bound > supported_degree {
-                    bail!(
-                        "The highest enforced degree bound {highest_enforced_degree_bound} is larger than the supported degree {supported_degree}"
-                    );
-                }
-
+        let (shifted_powers_of_beta_g, shifted_powers_of_beta_times_gamma_g) = match enforced_degree_bounds.as_deref() {
+            // The bounds are sorted, so the last is the highest.
+            Some(enforced_degree_bounds @ [.., highest_enforced_degree_bound]) => {
                 let lowest_shift_degree = max_degree - highest_enforced_degree_bound;
 
                 let shifted_ck_time = start_timer!(|| format!(
@@ -130,8 +136,7 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
 
                 (Some(shifted_powers_of_beta_g), Some(shifted_powers_of_beta_times_gamma_g))
             }
-        } else {
-            (None, None)
+            _ => (None, None),
         };
 
         let (store, range) = pp.shared_powers_of_beta_g(0, supported_degree + 1)?;
@@ -150,12 +155,7 @@ impl<E: PairingEngine, S: AlgebraicSponge<E::Fq, 2>> SonicKZG10<E, S> {
         let mut lagrange_bases_at_beta_g = BTreeMap::new();
         for size in supported_lagrange_sizes {
             let lagrange_time = start_timer!(|| format!("Constructing `lagrange_bases` of size {size}"));
-            if !size.is_power_of_two() {
-                bail!("The Lagrange basis size ({size}) is not a power of two")
-            }
-            if size > pp.max_degree() + 1 {
-                bail!("The Lagrange basis size ({size}) is larger than the supported degree ({})", pp.max_degree() + 1)
-            }
+            // Validated above: the size is a power of two no larger than the SRS.
             let domain = crate::fft::EvaluationDomain::new(size).unwrap();
             let lagrange_basis_at_beta_g = pp.lagrange_basis(domain)?;
             assert!(lagrange_basis_at_beta_g.len().is_power_of_two());
@@ -807,6 +807,22 @@ mod tests {
         assert!(pp.powers_of_beta_g(0, 0).unwrap().is_empty());
         let (after, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
         assert!(std::sync::Arc::ptr_eq(&before, &after), "an empty range replaced the snapshot");
+    }
+
+    /// A `trim` that fails validation downloads nothing first, so a rejected
+    /// call leaves the SRS, snapshot included, as it was.
+    #[test]
+    fn a_rejected_trim_downloads_nothing() {
+        let pp = PC_Bls12_377::load_srs((1 << 15) - 1).unwrap();
+        let (before, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
+        let grown = 1 << 16;
+        // A degree bound above the supported degree.
+        assert!(PC_Bls12_377::trim(&pp, grown - 1, [], 1, Some(&[grown])).is_err());
+        // A Lagrange size that is not a power of two, and one beyond the SRS.
+        assert!(PC_Bls12_377::trim(&pp, grown - 1, [3], 1, None).is_err());
+        assert!(PC_Bls12_377::trim(&pp, grown - 1, [1 << 29], 1, None).is_err());
+        let (after, _) = pp.shared_powers_of_beta_g(0, 1).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&before, &after), "a rejected trim grew the SRS");
     }
 
     /// `to_mut` turns a shared range into an owned copy, leaving the SRS as it
